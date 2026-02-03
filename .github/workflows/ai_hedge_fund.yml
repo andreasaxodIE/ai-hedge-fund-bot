@@ -1,4 +1,4 @@
-name: AI Hedge Fund (Free Mode)
+name: AI Hedge Fund (Gemini)
 
 on:
   issues:
@@ -28,12 +28,12 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run AI Hedge Fund
+      - name: Run AI Hedge Fund (Gemini)
         env:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BENCHMARK_TICKER: "^GSPC"
         run: |
           python src/main.py
-
