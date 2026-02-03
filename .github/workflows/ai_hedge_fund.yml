@@ -8,6 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   issues: write
 
 jobs:
@@ -32,4 +33,3 @@ jobs:
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python src/main.py
-
