@@ -1,4 +1,4 @@
-name: AI Hedge Fund (Issues)
+name: AI Hedge Fund (Free Mode)
 
 on:
   issues:
@@ -14,22 +14,24 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
-      - name: Run
+      - name: Run AI Hedge Fund (Free Mode)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python src/main.py
+        run: |
+          python src/main.py
