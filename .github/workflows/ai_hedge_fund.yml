@@ -36,5 +36,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BENCHMARK_TICKER: "^GSPC"
           GEMINI_MAX_OUTPUT_TOKENS: "2200"
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XAI_MODEL: "grok-4"                         
         run: |
           python src/main.py
