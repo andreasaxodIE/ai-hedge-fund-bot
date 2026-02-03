@@ -12,16 +12,16 @@ from google.genai import types
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DEFAULT_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
 
-# Global cap (committee + CRO). We'll allocate per-step below.
-DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2200"))
-
 MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
 BACKOFF_BASE_SECONDS = float(os.getenv("GEMINI_BACKOFF_BASE_SECONDS", "1.5"))
 
-# Per-step output budgets (prevents truncation)
-TOKENS_AGENT = int(os.getenv("GEMINI_AGENT_TOKENS", "700"))
-TOKENS_CRO = int(os.getenv("GEMINI_CRO_TOKENS", "1500"))
-TOKENS_REPAIR = int(os.getenv("GEMINI_REPAIR_TOKENS", "900"))
+# Token budgets (tuned for reliability)
+TOKENS_AGENT = int(os.getenv("GEMINI_AGENT_TOKENS", "850"))
+TOKENS_CRO = int(os.getenv("GEMINI_CRO_TOKENS", "1700"))
+TOKENS_REPAIR = int(os.getenv("GEMINI_REPAIR_TOKENS", "650"))
+
+# How many repair passes allowed per section
+MAX_REPAIR_PASSES = int(os.getenv("GEMINI_MAX_REPAIR_PASSES", "2"))
 
 
 # -------------------------
@@ -66,15 +66,6 @@ def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: 
 # -------------------------
 # Data helpers
 # -------------------------
-
-def _safe_get(d: Any, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
 
 def _parse_stooq_csv(csv_text: str) -> List[float]:
     closes: List[float] = []
@@ -226,14 +217,13 @@ def _calc_stats(closes: List[float]) -> Dict[str, Any]:
 
 
 # -------------------------
-# Factsheet builder (clean)
+# Factsheet builder
 # -------------------------
 
 def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     closes, source = _extract_closes(bundle)
     stats = _calc_stats(closes) if closes else {"ok": False}
 
-    # Yahoo quote fundamentals
     yq = bundle.get("yahoo_quote") or {}
     yq_data = yq.get("data") if isinstance(yq, dict) else {}
     yq_data = yq_data if isinstance(yq_data, dict) else {}
@@ -245,7 +235,6 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
     sector = yq_data.get("sector")
     industry = yq_data.get("industry")
 
-    # Benchmark
     benchmark = bundle.get("benchmark", "^GSPC")
     bench_bundle = bundle.get("benchmark_chart") or {}
     bench_closes = bench_bundle.get("closes") if isinstance(bench_bundle, dict) else None
@@ -255,7 +244,6 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
     rel = None
     corr = None
     beta = None
-
     if stats.get("ok") and bench_stats.get("ok"):
         asset_rets = _daily_returns_from_closes(closes)
         bench_rets = _daily_returns_from_closes([float(x) for x in bench_closes])
@@ -312,173 +300,253 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
 
 
 # -------------------------
-# Output validation + repair
+# Validators + Repair
 # -------------------------
 
-_REQUIRED_CRO_FIELDS = [
-    "PORTFOLIO DECISION:",
-    "FINAL POSITION SIZE:",
-    "RISK RATING:",
-    "EXPECTED ANNUAL RETURN:",
-    "MAXIMUM EXPECTED LOSS:",
-    "COMMITTEE CONSENSUS:",
-    "IMPLEMENTATION PLAN:",
-    "RISK OFFICER SUMMARY:",
-]
+def _count_bullets(block: str) -> int:
+    return len(re.findall(r"(?m)^\s*-\s+", block or ""))
 
-def _looks_truncated(text: str) -> bool:
-    if not text:
-        return True
-    # ends with comma / open parenthesis / dangling fragment
-    if re.search(r"[,(\-]\s*$", text):
-        return True
-    # missing required fields
-    return any(f not in text for f in _REQUIRED_CRO_FIELDS)
 
-def _repair_cro_output(ticker: str, factsheet: str, cro_text: str) -> str:
-    repair_prompt = f"""
-You must FIX the following CRO output so it matches the required format exactly and is complete.
-Do NOT add any new facts beyond the FACTSHEET.
-If something is unknown, write "UNKNOWN" but still keep the field.
+def _has_fields(text: str, fields: List[str]) -> bool:
+    return all(f in (text or "") for f in fields)
+
+
+def _repair_section(section_name: str, factsheet: str, draft: str, required_fields: List[str], min_bullets: int) -> str:
+    prompt = f"""
+You are repairing a section named {section_name}.
+Rules:
+- Use ONLY the FACTSHEET (no invented facts).
+- Output MUST contain ALL required fields exactly as labels.
+- Any missing/unknown value => write UNKNOWN (but keep the field).
+- Any bullet section must have at least {min_bullets} bullets.
+- Keep concise.
 
 FACTSHEET:
 {factsheet}
 
-BROKEN CRO OUTPUT:
-{cro_text}
+DRAFT OUTPUT TO REPAIR:
+{draft}
 
-Return ONLY the corrected CRO output with the exact fields:
-PORTFOLIO DECISION:
-FINAL POSITION SIZE:
-RISK RATING:
-EXPECTED ANNUAL RETURN:
-MAXIMUM EXPECTED LOSS:
-COMMITTEE CONSENSUS:
-IMPLEMENTATION PLAN:
-RISK OFFICER SUMMARY:
+REQUIRED FIELDS (must all appear):
+{chr(10).join(required_fields)}
+
+Return ONLY the repaired section.
 """
     return _gemini_call(
-        system_instruction="You are a strict formatter and risk officer. Output must be complete and structured.",
-        user_content=repair_prompt,
+        system_instruction="You are a strict formatter. Never omit required fields.",
+        user_content=prompt,
         max_output_tokens=TOKENS_REPAIR,
     ).strip()
 
 
+def _ensure_valid(section_name: str, factsheet: str, draft: str, required_fields: List[str], min_bullets: int) -> str:
+    text = (draft or "").strip()
+    for _ in range(MAX_REPAIR_PASSES + 1):
+        ok_fields = _has_fields(text, required_fields)
+        ok_bullets = _count_bullets(text) >= min_bullets
+        if ok_fields and ok_bullets:
+            return text
+        text = _repair_section(section_name, factsheet, text, required_fields, min_bullets)
+    return text
+
+
 # -------------------------
-# Main committee runner
+# Committee runner
 # -------------------------
 
 def run_committee(ticker: str, bundle: dict) -> str:
     factsheet, meta = _make_factsheet(ticker, bundle)
     stats_ok = bool(meta["stats"].get("ok"))
     benchmark = bundle.get("benchmark", "^GSPC")
+    vol_regime = meta.get("stats", {}).get("regime", "UNKNOWN")
 
-    # Keep committee responses SHORT and structured; avoid dumping full blob into CRO.
-    common_instructions = """
+    common = f"""
 You are part of an investment committee.
 STRICT RULES:
-- Base reasoning ONLY on the FACTSHEET.
-- Do NOT invent valuation, financial statements, or news.
-- If DATA_QUALITY is LOW, be conservative (MONITOR / NO-TRADE).
-- Minimum bullets: if a section asks for bullets, provide at least 3 bullets.
-- Keep it concise.
-"""
-
-    ctx = f"""{common_instructions}
-
+- Use ONLY the FACTSHEET (no outside knowledge, no news).
+- If DATA_QUALITY is LOW => conservative MONITOR.
+- For any bullet list: minimum 3 bullets.
+- If you don't know something: write UNKNOWN.
+- Keep concise and structured.
 FACTSHEET:
 {factsheet}
 """
 
-    buffett = _gemini_call(
-        system_instruction="You are Warren Buffett. Value, moat, quality, margin of safety.",
-        user_content=ctx + """
-Output format (must follow exactly):
+    buffett_raw = _gemini_call(
+        system_instruction="You are Warren Buffett. Value investing, moat, quality, patience.",
+        user_content=common + """
+Output format (exact labels required):
 BUFFETT RECOMMENDATION: [BUY/HOLD/SELL/MONITOR]
 CONVICTION LEVEL: [1-10]
 TARGET ALLOCATION: [0-25%]
-TIME HORIZON: [5-10+ years]
+TIME HORIZON: [5-10+ years/UNKNOWN]
 INVESTMENT THESIS:
-- (min 3 bullets)
+- ...
 RISK FACTORS:
-- (min 3 bullets)
+- ...
 """,
         max_output_tokens=TOKENS_AGENT,
     )
 
-    munger = _gemini_call(
-        system_instruction="You are Charlie Munger. Mental models, incentives, second-order effects.",
-        user_content=ctx + """
-Output format (must follow exactly):
+    buffett = _ensure_valid(
+        "BUFFETT",
+        factsheet,
+        buffett_raw,
+        required_fields=[
+            "BUFFETT RECOMMENDATION:",
+            "CONVICTION LEVEL:",
+            "TARGET ALLOCATION:",
+            "TIME HORIZON:",
+            "INVESTMENT THESIS:",
+            "RISK FACTORS:",
+        ],
+        min_bullets=6,  # 3 thesis + 3 risks
+    )
+
+    munger_raw = _gemini_call(
+        system_instruction="You are Charlie Munger. Mental models, incentives, second-order thinking.",
+        user_content=common + """
+Output format (exact labels required):
 MUNGER ANALYSIS: [OPPORTUNITY/CAUTION/AVOID/MONITOR]
 RISK RATING: [1-10]
 CIRCLE OF COMPETENCE: [IN/OUT/BORDERLINE]
 KEY MENTAL MODELS APPLIED:
-- (min 3 bullets)
+- ...
 CONTRARIAN INSIGHTS:
-- (min 3 bullets)
+- ...
 """,
         max_output_tokens=TOKENS_AGENT,
     )
 
-    ackman = _gemini_call(
-        system_instruction="You are Bill Ackman. Catalysts, governance, concentrated bets.",
-        user_content=ctx + """
-Output format (must follow exactly):
+    munger = _ensure_valid(
+        "MUNGER",
+        factsheet,
+        munger_raw,
+        required_fields=[
+            "MUNGER ANALYSIS:",
+            "RISK RATING:",
+            "CIRCLE OF COMPETENCE:",
+            "KEY MENTAL MODELS APPLIED:",
+            "CONTRARIAN INSIGHTS:",
+        ],
+        min_bullets=6,
+    )
+
+    ackman_raw = _gemini_call(
+        system_instruction="You are Bill Ackman. Catalysts, governance, sizing discipline.",
+        user_content=common + """
+Output format (exact labels required):
 ACKMAN POSITION: [LONG/SHORT/ACTIVIST LONG/NO-TRADE/MONITOR]
 CONVICTION LEVEL: [1-10]
 CATALYST TIMELINE: [6-36 months/UNKNOWN]
-TARGET POSITION SIZE: [0-20%]
+TARGET POSITION SIZE: [0-20%/UNKNOWN]
 THESIS:
-- (min 3 bullets)
+- ...
 CATALYSTS:
-- (min 3 bullets)
+- ...
 """,
         max_output_tokens=TOKENS_AGENT,
     )
 
-    cohen = _gemini_call(
-        system_instruction="You are Steve Cohen. Trading plan, risk control, tactical sizing.",
-        user_content=ctx + """
-Output format (must follow exactly):
+    ackman = _ensure_valid(
+        "ACKMAN",
+        factsheet,
+        ackman_raw,
+        required_fields=[
+            "ACKMAN POSITION:",
+            "CONVICTION LEVEL:",
+            "CATALYST TIMELINE:",
+            "TARGET POSITION SIZE:",
+            "THESIS:",
+            "CATALYSTS:",
+        ],
+        min_bullets=6,
+    )
+
+    cohen_raw = _gemini_call(
+        system_instruction="You are Steve Cohen. Tactical trading, risk control, stops.",
+        user_content=common + """
+Output format (exact labels required):
 COHEN TRADE: [LONG/SHORT/HEDGE/NO-TRADE/MONITOR]
 CONVICTION: [1-10]
 POSITION SIZE: [%]
 ENTRY:
-- (min 3 bullets)
+- ...
 TAKE PROFIT:
-- (min 3 bullets)
+- ...
 STOP LOSS:
-- (min 3 bullets)
+- ...
 KEY DRIVERS:
-- (min 3 bullets)
+- ...
 """,
         max_output_tokens=TOKENS_AGENT,
     )
 
-    dalio = _gemini_call(
-        system_instruction="You are Ray Dalio. Macro regimes, cycles, diversification.",
-        user_content=ctx + """
-Output format (must follow exactly):
+    cohen = _ensure_valid(
+        "COHEN",
+        factsheet,
+        cohen_raw,
+        required_fields=[
+            "COHEN TRADE:",
+            "CONVICTION:",
+            "POSITION SIZE:",
+            "ENTRY:",
+            "TAKE PROFIT:",
+            "STOP LOSS:",
+            "KEY DRIVERS:",
+        ],
+        min_bullets=12,  # 3 bullets per list x4
+    )
+
+    dalio_raw = _gemini_call(
+        system_instruction="You are Ray Dalio. Macro regimes, risk balance, diversification.",
+        user_content=common + """
+Output format (exact labels required):
 DALIO STRATEGY: [ALLOCATE/REDUCE/HEDGE/AVOID/MONITOR]
 MACRO ENVIRONMENT SCORE: [1-10]
 DIVERSIFICATION VALUE: [HIGH/MEDIUM/LOW]
 RISK CONTRIBUTION: [LOW/MEDIUM/HIGH]
 ECONOMIC SEASON: [GROWTH/RECESSION/REFLATION/STAGFLATION/UNKNOWN]
 MACRO ANALYSIS:
-- (min 3 bullets)
+- ...
 PORTFOLIO FIT:
-- (min 3 bullets)
+- ...
 """,
         max_output_tokens=TOKENS_AGENT,
     )
 
-    # CRO gets a compact summary input (factsheet + key lines), NOT the full blob.
-    cro_input = f"""
+    dalio = _ensure_valid(
+        "DALIO",
+        factsheet,
+        dalio_raw,
+        required_fields=[
+            "DALIO STRATEGY:",
+            "MACRO ENVIRONMENT SCORE:",
+            "DIVERSIFICATION VALUE:",
+            "RISK CONTRIBUTION:",
+            "ECONOMIC SEASON:",
+            "MACRO ANALYSIS:",
+            "PORTFOLIO FIT:",
+        ],
+        min_bullets=6,
+    )
+
+    # CRO: include HARD risk rules so it doesn't output nonsense
+    cro_prompt = f"""
+You are the Chief Risk Officer & Portfolio Manager.
+You must output all required fields.
+
+Hard rules (apply deterministically):
+- If DATA_QUALITY is LOW => PORTFOLIO DECISION must be MONITOR and FINAL POSITION SIZE must be 0.0%.
+- If VOL_REGIME is ELEVATED and decision is IMPLEMENT/MODIFY => FINAL POSITION SIZE must be <= 2.0% and include a hard STOP LOSS in plan.
+- MAXIMUM EXPECTED LOSS must be a negative percent like -12.0%.
+- EXPECTED ANNUAL RETURN must be a percent like 15.0%.
+- Do not invent fundamentals or news; use only FACTSHEET + committee.
+
 FACTSHEET:
 {factsheet}
 
-COMMITTEE SUMMARIES (verbatim):
+COMMITTEE (verbatim):
 BUFFETT:
 {buffett}
 
@@ -494,35 +562,41 @@ COHEN:
 DALIO:
 {dalio}
 
-Ticker: {ticker}
-Benchmark: {benchmark}
-"""
-
-    cro = _gemini_call(
-        system_instruction=(
-            "You are the Chief Risk Officer & Portfolio Manager. "
-            "Synthesize into a complete decision. "
-            "If DATA_QUALITY is LOW -> MONITOR (not REJECT). "
-            "If VOL_REGIME is ELEVATED -> keep sizing conservative and require a hard stop."
-        ),
-        user_content=cro_input + """
-Output format (must follow exactly):
+Output format (exact labels required):
 PORTFOLIO DECISION: [IMPLEMENT/MODIFY/MONITOR/REJECT]
 FINAL POSITION SIZE: X.X%
 RISK RATING: [1-10]
-EXPECTED ANNUAL RETURN: X.X% (rough estimate)
-MAXIMUM EXPECTED LOSS: -X.X% (rough estimate)
+EXPECTED ANNUAL RETURN: X.X%
+MAXIMUM EXPECTED LOSS: -X.X%
 COMMITTEE CONSENSUS:
-- bullet points (who agrees/disagrees)
+- ...
 IMPLEMENTATION PLAN:
-- bullet points (entry, stop, targets, monitoring)
+- ...
 RISK OFFICER SUMMARY: 2-3 lines
-""",
-        max_output_tokens=TOKENS_CRO,
-    ).strip()
+"""
 
-    if _looks_truncated(cro):
-        cro = _repair_cro_output(ticker, factsheet, cro)
+    cro_raw = _gemini_call(
+        system_instruction="You are a strict CRO. Never omit fields. Follow hard rules.",
+        user_content=cro_prompt,
+        max_output_tokens=TOKENS_CRO,
+    )
+
+    cro = _ensure_valid(
+        "CRO",
+        factsheet,
+        cro_raw,
+        required_fields=[
+            "PORTFOLIO DECISION:",
+            "FINAL POSITION SIZE:",
+            "RISK RATING:",
+            "EXPECTED ANNUAL RETURN:",
+            "MAXIMUM EXPECTED LOSS:",
+            "COMMITTEE CONSENSUS:",
+            "IMPLEMENTATION PLAN:",
+            "RISK OFFICER SUMMARY:",
+        ],
+        min_bullets=6,  # 3 consensus + 3 plan
+    )
 
     dq = "OK" if stats_ok else "LOW"
     source = meta.get("source", "unknown")
@@ -549,7 +623,7 @@ RISK OFFICER SUMMARY: 2-3 lines
 
     return f"""## {ticker} — Gemini Committee Report
 
-_Data quality: **{dq}** | Price source: **{source}** | Benchmark: **{benchmark}**_
+_Data quality: **{dq}** | Price source: **{source}** | Benchmark: **{benchmark}** | Vol regime: **{vol_regime}**_
 
 {cro}
 
