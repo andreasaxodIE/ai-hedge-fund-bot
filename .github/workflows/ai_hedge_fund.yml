@@ -35,5 +35,6 @@ jobs:
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BENCHMARK_TICKER: "^GSPC"
+          GEMINI_MAX_OUTPUT_TOKENS: "2200"
         run: |
           python src/main.py
