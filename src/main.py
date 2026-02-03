@@ -28,24 +28,12 @@ def post_comment(repo_full_name: str, issue_number: int, body: str):
     return r.json()
 
 def extract_ticker(text: str) -> str | None:
-    """
-    Accepts inputs like:
-      TSLA
-      $TSLA
-      analyze TSLA
-      /analyze TSLA
-    """
     if not text:
         return None
     t = text.strip().upper()
-
-    # try to find first plausible ticker token
-    # allow $TSLA too
     candidates = re.findall(r"\$?[A-Z0-9]{1,6}", t)
     if not candidates:
         return None
-
-    # choose first, strip $
     sym = candidates[0].lstrip("$")
     if 1 <= len(sym) <= 6 and sym.isalnum():
         return sym
@@ -60,28 +48,21 @@ def is_allowed_user(sender_login: str) -> bool:
 
 def main():
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    repo = os.environ["GITHUB_REPOSITORY"]  # owner/repo
+    repo = os.environ["GITHUB_REPOSITORY"]
     event = load_event()
 
-    # Identify issue + sender + text depending on trigger type
     sender = (event.get("sender") or {}).get("login", "unknown")
-
     if not is_allowed_user(sender):
-        # silently ignore (or you can comment a denial)
         return
 
     issue = event.get("issue")
     if not issue:
         return
-
     issue_number = issue["number"]
 
-    text_source = ""
     if event_name == "issues":
-        # opening an issue: use title + body
         text_source = (issue.get("title") or "") + "\n" + (issue.get("body") or "")
     elif event_name == "issue_comment":
-        # new comment on an issue: use comment body
         comment = event.get("comment") or {}
         text_source = comment.get("body") or ""
     else:
@@ -89,29 +70,41 @@ def main():
 
     ticker = extract_ticker(text_source)
     if not ticker:
+        post_comment(repo, issue_number, "I couldn’t detect a ticker. Try: `TSLA` or `$TSLA`.")
+        return
+
+    post_comment(repo, issue_number, f"✅ Running AI Hedge Fund analysis for **{ticker}**…")
+
+    # Fetch data safely
+    try:
+        bundle = fetch_market_bundle(ticker)
+    except Exception as e:
         post_comment(
             repo,
             issue_number,
-            "I couldn’t detect a ticker. Try: `TSLA` or `/analyze TSLA` or `$TSLA`."
+            f"❌ Data fetch failed for **{ticker}**.\n\n"
+            f"Error: `{type(e).__name__}: {e}`\n\n"
+            f"Check your `MASSIVE_API_KEY` secret and whether your plan allows the snapshot/aggs endpoints."
         )
         return
 
-    # Acknowledge
-    post_comment(repo, issue_number, f"✅ Running AI Hedge Fund analysis for **{ticker}**…")
+    # Run committee safely
+    try:
+        report = run_committee(ticker, bundle)
+    except Exception as e:
+        post_comment(
+            repo,
+            issue_number,
+            f"❌ LLM analysis failed for **{ticker}**.\n\n"
+            f"Error: `{type(e).__name__}: {e}`\n\n"
+            f"Check `OPENAI_API_KEY` secret and model access."
+        )
+        return
 
-    # Fetch data from Massive
-    bundle = fetch_market_bundle(ticker)
-
-    # Run committee + risk officer
-    report = run_committee(ticker, bundle)
-
-    # GitHub comment limit is generous, but chunk anyway to be safe
     chunks = chunk_text(report, chunk_size=60000)
-
     for i, c in enumerate(chunks, start=1):
         header = f"### AI Hedge Fund Report — {ticker} (Part {i}/{len(chunks)})\n"
         post_comment(repo, issue_number, header + "\n" + c)
 
 if __name__ == "__main__":
     main()
-
