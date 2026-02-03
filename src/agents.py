@@ -63,9 +63,10 @@ def _calc_stats_from_closes(closes):
 
 def _extract_prices(bundle: dict):
     """
-    Prefer Massive aggs if they look valid; else use Stooq fallback CSV.
+    Prefer Massive aggs if valid; else Yahoo closes; else Stooq CSV.
     Returns (closes, source_str)
     """
+    # 1) Massive aggs
     aggs = bundle.get("aggs_30d")
     results = _safe_get(aggs, "results", default=None)
     if isinstance(results, list) and results:
@@ -77,15 +78,23 @@ def _extract_prices(bundle: dict):
         if len(closes) >= 5:
             return closes, "massive_aggs_30d"
 
+    # 2) Yahoo fallback
+    y = bundle.get("fallback_prices_yahoo") or {}
+    y_closes = y.get("closes")
+    if isinstance(y_closes, list) and len(y_closes) >= 5:
+        return [float(x) for x in y_closes if x], "yahoo_fallback"
+
+    # 3) Stooq fallback
     fb = bundle.get("fallback_prices", {})
     csv_text = fb.get("csv", "")
     rows = _parse_stooq_csv(csv_text)
-    rows = rows[-30:]  # last ~30 rows
+    rows = rows[-30:]
     closes = [x["close"] for x in rows]
     if len(closes) >= 5:
         return closes, "stooq_fallback"
 
     return [], "none"
+
 
 def _score_company_quality(bundle: dict):
     """
