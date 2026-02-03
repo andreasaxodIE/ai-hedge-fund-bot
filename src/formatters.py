@@ -3,7 +3,7 @@ def chunk_text(text: str, chunk_size: int = 60000):
     chunks = []
     i = 0
     while i < len(text):
-        chunk = text[i:i+chunk_size]
+        chunk = text[i:i + chunk_size]
         if i + chunk_size < len(text):
             cut = chunk.rfind("\n")
             if cut > int(chunk_size * 0.7):
@@ -15,4 +15,3 @@ def chunk_text(text: str, chunk_size: int = 60000):
             i += chunk_size
         chunks.append(chunk)
     return [c for c in chunks if c.strip()]
-
