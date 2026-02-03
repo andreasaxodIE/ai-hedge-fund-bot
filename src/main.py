@@ -28,16 +28,50 @@ def post_comment(repo_full_name: str, issue_number: int, body: str):
     return r.json()
 
 def extract_ticker(text: str) -> str | None:
+    """
+    Supports:
+      TSLA
+      BNPQY
+      BNP.PA
+      AIR.PA
+      NESN.SW
+      $BNP.PA
+      /analyze BNP.PA
+    """
     if not text:
         return None
+
     t = text.strip().upper()
-    candidates = re.findall(r"\$?[A-Z0-9]{1,6}", t)
+
+    # allow tickers with optional dot suffix (e.g. BNP.PA, NESN.SW)
+    candidates = re.findall(r"\$?[A-Z0-9]{1,6}(?:\.[A-Z0-9]{1,4})?", t)
     if not candidates:
         return None
+
     sym = candidates[0].lstrip("$")
-    if 1 <= len(sym) <= 6 and sym.isalnum():
+
+    # final sanity check
+    if 1 <= len(sym) <= 12 and sym.replace(".", "").isalnum():
         return sym
+
     return None
+
+
+    t = text.strip().upper()
+
+    # allow tickers with optional dot suffix (e.g. BNP.PA, NESN.SW)
+    candidates = re.findall(r"\$?[A-Z0-9]{1,6}(?:\.[A-Z0-9]{1,4})?", t)
+    if not candidates:
+        return None
+
+    sym = candidates[0].lstrip("$")
+
+    # final sanity check
+    if 1 <= len(sym) <= 12 and sym.replace(".", "").isalnum():
+        return sym
+
+    return None
+
 
 def is_allowed_user(sender_login: str) -> bool:
     allowed = os.environ.get("ALLOWED_USERS", "").strip()
