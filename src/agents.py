@@ -3,6 +3,7 @@ import time
 import math
 import csv
 import io
+import re
 from typing import Optional, Tuple, List, Dict, Any
 
 from google import genai
@@ -10,11 +11,22 @@ from google.genai import types
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DEFAULT_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
-DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1200"))
+
+# Global cap (committee + CRO). We'll allocate per-step below.
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2200"))
 
 MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
 BACKOFF_BASE_SECONDS = float(os.getenv("GEMINI_BACKOFF_BASE_SECONDS", "1.5"))
 
+# Per-step output budgets (prevents truncation)
+TOKENS_AGENT = int(os.getenv("GEMINI_AGENT_TOKENS", "700"))
+TOKENS_CRO = int(os.getenv("GEMINI_CRO_TOKENS", "1500"))
+TOKENS_REPAIR = int(os.getenv("GEMINI_REPAIR_TOKENS", "900"))
+
+
+# -------------------------
+# Gemini Client + Call
+# -------------------------
 
 def _client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -22,6 +34,38 @@ def _client() -> genai.Client:
         raise RuntimeError("Missing GEMINI_API_KEY.")
     return genai.Client(api_key=api_key)
 
+
+def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: int) -> str:
+    client = _client()
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=DEFAULT_TEMPERATURE,
+        max_output_tokens=max_output_tokens,
+    )
+
+    last_err: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = client.models.generate_content(
+                model=DEFAULT_MODEL,
+                contents=user_content,
+                config=config,
+            )
+            return (getattr(resp, "text", None) or "").strip()
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = any(x in msg for x in ["429", "rate", "quota", "timeout", "503", "unavailable", "internal"])
+            if attempt >= MAX_RETRIES or not transient:
+                raise
+            time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+
+    raise last_err or RuntimeError("Gemini call failed.")
+
+
+# -------------------------
+# Data helpers
+# -------------------------
 
 def _safe_get(d: Any, *keys, default=None):
     cur = d
@@ -181,11 +225,15 @@ def _calc_stats(closes: List[float]) -> Dict[str, Any]:
     }
 
 
+# -------------------------
+# Factsheet builder (clean)
+# -------------------------
+
 def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     closes, source = _extract_closes(bundle)
     stats = _calc_stats(closes) if closes else {"ok": False}
 
-    # Yahoo quote (free fundamentals)
+    # Yahoo quote fundamentals
     yq = bundle.get("yahoo_quote") or {}
     yq_data = yq.get("data") if isinstance(yq, dict) else {}
     yq_data = yq_data if isinstance(yq_data, dict) else {}
@@ -197,7 +245,7 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
     sector = yq_data.get("sector")
     industry = yq_data.get("industry")
 
-    # Benchmark data
+    # Benchmark
     benchmark = bundle.get("benchmark", "^GSPC")
     bench_bundle = bundle.get("benchmark_chart") or {}
     bench_closes = bench_bundle.get("closes") if isinstance(bench_bundle, dict) else None
@@ -259,136 +307,227 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
     else:
         facts.append("BENCHMARK_DATA: LOW")
 
-    meta = {
-        "source": source,
-        "stats": stats,
-        "bench_stats": bench_stats,
-    }
+    meta = {"source": source, "stats": stats, "bench_stats": bench_stats}
     return "\n".join(facts), meta
 
 
-def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: int) -> str:
-    client = _client()
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=DEFAULT_TEMPERATURE,
-        max_output_tokens=max_output_tokens,
-    )
+# -------------------------
+# Output validation + repair
+# -------------------------
 
-    last_err: Optional[Exception] = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            resp = client.models.generate_content(
-                model=DEFAULT_MODEL,
-                contents=user_content,
-                config=config,
-            )
-            return (getattr(resp, "text", None) or "").strip()
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            transient = any(x in msg for x in ["429", "rate", "quota", "timeout", "503", "unavailable", "internal"])
-            if attempt >= MAX_RETRIES or not transient:
-                raise
-            time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
+_REQUIRED_CRO_FIELDS = [
+    "PORTFOLIO DECISION:",
+    "FINAL POSITION SIZE:",
+    "RISK RATING:",
+    "EXPECTED ANNUAL RETURN:",
+    "MAXIMUM EXPECTED LOSS:",
+    "COMMITTEE CONSENSUS:",
+    "IMPLEMENTATION PLAN:",
+    "RISK OFFICER SUMMARY:",
+]
 
-    raise last_err or RuntimeError("Gemini call failed.")
+def _looks_truncated(text: str) -> bool:
+    if not text:
+        return True
+    # ends with comma / open parenthesis / dangling fragment
+    if re.search(r"[,(\-]\s*$", text):
+        return True
+    # missing required fields
+    return any(f not in text for f in _REQUIRED_CRO_FIELDS)
 
+def _repair_cro_output(ticker: str, factsheet: str, cro_text: str) -> str:
+    repair_prompt = f"""
+You must FIX the following CRO output so it matches the required format exactly and is complete.
+Do NOT add any new facts beyond the FACTSHEET.
+If something is unknown, write "UNKNOWN" but still keep the field.
+
+FACTSHEET:
+{factsheet}
+
+BROKEN CRO OUTPUT:
+{cro_text}
+
+Return ONLY the corrected CRO output with the exact fields:
+PORTFOLIO DECISION:
+FINAL POSITION SIZE:
+RISK RATING:
+EXPECTED ANNUAL RETURN:
+MAXIMUM EXPECTED LOSS:
+COMMITTEE CONSENSUS:
+IMPLEMENTATION PLAN:
+RISK OFFICER SUMMARY:
+"""
+    return _gemini_call(
+        system_instruction="You are a strict formatter and risk officer. Output must be complete and structured.",
+        user_content=repair_prompt,
+        max_output_tokens=TOKENS_REPAIR,
+    ).strip()
+
+
+# -------------------------
+# Main committee runner
+# -------------------------
 
 def run_committee(ticker: str, bundle: dict) -> str:
     factsheet, meta = _make_factsheet(ticker, bundle)
     stats_ok = bool(meta["stats"].get("ok"))
+    benchmark = bundle.get("benchmark", "^GSPC")
 
+    # Keep committee responses SHORT and structured; avoid dumping full blob into CRO.
     common_instructions = """
 You are part of an investment committee.
 STRICT RULES:
-- Base your reasoning primarily on the FACTSHEET below.
-- Do NOT invent financial statements, valuation multiples, or news.
-- If DATA_QUALITY is LOW, output conservative MONITOR / NO-TRADE stances (not catastrophic rejection).
-- Be structured, concise, and actionable.
+- Base reasoning ONLY on the FACTSHEET.
+- Do NOT invent valuation, financial statements, or news.
+- If DATA_QUALITY is LOW, be conservative (MONITOR / NO-TRADE).
+- Minimum bullets: if a section asks for bullets, provide at least 3 bullets.
+- Keep it concise.
 """
 
-    user_context = f"""{common_instructions}
+    ctx = f"""{common_instructions}
 
 FACTSHEET:
 {factsheet}
 """
 
     buffett = _gemini_call(
-        system_instruction=(
-            "You are Warren Buffett. Long-term value investing: moat, management, intrinsic value, margin of safety. "
-            "If fundamentals are missing, say what you'd want next, but still provide a conservative stance."
-        ),
-        user_content=user_context + """
-Output format:
+        system_instruction="You are Warren Buffett. Value, moat, quality, margin of safety.",
+        user_content=ctx + """
+Output format (must follow exactly):
 BUFFETT RECOMMENDATION: [BUY/HOLD/SELL/MONITOR]
 CONVICTION LEVEL: [1-10]
 TARGET ALLOCATION: [0-25%]
 TIME HORIZON: [5-10+ years]
-INVESTMENT THESIS: bullet points
-RISK FACTORS: bullet points
+INVESTMENT THESIS:
+- (min 3 bullets)
+RISK FACTORS:
+- (min 3 bullets)
 """,
-        max_output_tokens=900,
+        max_output_tokens=TOKENS_AGENT,
     )
 
     munger = _gemini_call(
-        system_instruction="You are Charlie Munger. Apply mental models, incentives, second-order effects. Be skeptical.",
-        user_content=user_context + """
-Output format:
+        system_instruction="You are Charlie Munger. Mental models, incentives, second-order effects.",
+        user_content=ctx + """
+Output format (must follow exactly):
 MUNGER ANALYSIS: [OPPORTUNITY/CAUTION/AVOID/MONITOR]
 RISK RATING: [1-10]
 CIRCLE OF COMPETENCE: [IN/OUT/BORDERLINE]
-KEY MENTAL MODELS APPLIED: bullet points
-CONTRARIAN INSIGHTS: bullet points
+KEY MENTAL MODELS APPLIED:
+- (min 3 bullets)
+CONTRARIAN INSIGHTS:
+- (min 3 bullets)
 """,
-        max_output_tokens=800,
+        max_output_tokens=TOKENS_AGENT,
     )
 
     ackman = _gemini_call(
-        system_instruction="You are Bill Ackman. Focus on catalysts, governance, concentrated sizing. If data is limited, keep it high-level.",
-        user_content=user_context + """
-Output format:
+        system_instruction="You are Bill Ackman. Catalysts, governance, concentrated bets.",
+        user_content=ctx + """
+Output format (must follow exactly):
 ACKMAN POSITION: [LONG/SHORT/ACTIVIST LONG/NO-TRADE/MONITOR]
 CONVICTION LEVEL: [1-10]
-CATALYST TIMELINE: [6-36 months]
+CATALYST TIMELINE: [6-36 months/UNKNOWN]
 TARGET POSITION SIZE: [0-20%]
-ACTIVIST THESIS: bullet points
-CATALYSTS: bullet points
+THESIS:
+- (min 3 bullets)
+CATALYSTS:
+- (min 3 bullets)
 """,
-        max_output_tokens=800,
+        max_output_tokens=TOKENS_AGENT,
     )
 
     cohen = _gemini_call(
-        system_instruction="You are Steve Cohen. Trading-oriented: entry/exit, stops, catalysts, sizing, risk control.",
-        user_content=user_context + """
-Output format:
+        system_instruction="You are Steve Cohen. Trading plan, risk control, tactical sizing.",
+        user_content=ctx + """
+Output format (must follow exactly):
 COHEN TRADE: [LONG/SHORT/HEDGE/NO-TRADE/MONITOR]
 CONVICTION: [1-10]
 POSITION SIZE: [%]
-ENTRY: levels/conditions
-TAKE PROFIT: levels
-STOP LOSS: levels
-KEY DRIVERS: bullet points
+ENTRY:
+- (min 3 bullets)
+TAKE PROFIT:
+- (min 3 bullets)
+STOP LOSS:
+- (min 3 bullets)
+KEY DRIVERS:
+- (min 3 bullets)
 """,
-        max_output_tokens=800,
+        max_output_tokens=TOKENS_AGENT,
     )
 
     dalio = _gemini_call(
-        system_instruction="You are Ray Dalio. Macro regimes, cycles, diversification, correlation, risk contribution.",
-        user_content=user_context + """
-Output format:
+        system_instruction="You are Ray Dalio. Macro regimes, cycles, diversification.",
+        user_content=ctx + """
+Output format (must follow exactly):
 DALIO STRATEGY: [ALLOCATE/REDUCE/HEDGE/AVOID/MONITOR]
 MACRO ENVIRONMENT SCORE: [1-10]
 DIVERSIFICATION VALUE: [HIGH/MEDIUM/LOW]
 RISK CONTRIBUTION: [LOW/MEDIUM/HIGH]
 ECONOMIC SEASON: [GROWTH/RECESSION/REFLATION/STAGFLATION/UNKNOWN]
-MACRO ANALYSIS: bullet points
-PORTFOLIO FIT: bullet points
+MACRO ANALYSIS:
+- (min 3 bullets)
+PORTFOLIO FIT:
+- (min 3 bullets)
 """,
-        max_output_tokens=850,
+        max_output_tokens=TOKENS_AGENT,
     )
 
-    committee_blob = f"""
+    # CRO gets a compact summary input (factsheet + key lines), NOT the full blob.
+    cro_input = f"""
+FACTSHEET:
+{factsheet}
+
+COMMITTEE SUMMARIES (verbatim):
+BUFFETT:
+{buffett}
+
+MUNGER:
+{munger}
+
+ACKMAN:
+{ackman}
+
+COHEN:
+{cohen}
+
+DALIO:
+{dalio}
+
+Ticker: {ticker}
+Benchmark: {benchmark}
+"""
+
+    cro = _gemini_call(
+        system_instruction=(
+            "You are the Chief Risk Officer & Portfolio Manager. "
+            "Synthesize into a complete decision. "
+            "If DATA_QUALITY is LOW -> MONITOR (not REJECT). "
+            "If VOL_REGIME is ELEVATED -> keep sizing conservative and require a hard stop."
+        ),
+        user_content=cro_input + """
+Output format (must follow exactly):
+PORTFOLIO DECISION: [IMPLEMENT/MODIFY/MONITOR/REJECT]
+FINAL POSITION SIZE: X.X%
+RISK RATING: [1-10]
+EXPECTED ANNUAL RETURN: X.X% (rough estimate)
+MAXIMUM EXPECTED LOSS: -X.X% (rough estimate)
+COMMITTEE CONSENSUS:
+- bullet points (who agrees/disagrees)
+IMPLEMENTATION PLAN:
+- bullet points (entry, stop, targets, monitoring)
+RISK OFFICER SUMMARY: 2-3 lines
+""",
+        max_output_tokens=TOKENS_CRO,
+    ).strip()
+
+    if _looks_truncated(cro):
+        cro = _repair_cro_output(ticker, factsheet, cro)
+
+    dq = "OK" if stats_ok else "LOW"
+    source = meta.get("source", "unknown")
+
+    full_committee = f"""
 === FACTSHEET (CLEAN INPUT) ===
 {factsheet}
 
@@ -408,41 +547,15 @@ PORTFOLIO FIT: bullet points
 {dalio}
 """.strip()
 
-    risk_officer = _gemini_call(
-        system_instruction=(
-            "You are the Chief Risk Officer & Portfolio Manager. Synthesize into one actionable decision. "
-            "If DATA_QUALITY is LOW, choose MONITOR (not REJECT) and specify what data to fetch next. "
-            "If DATA_QUALITY is OK, you may IMPLEMENT a small position with clear stops."
-        ),
-        user_content=committee_blob + f"""
-
-Ticker: {ticker}
-
-Output format:
-PORTFOLIO DECISION: [IMPLEMENT/MODIFY/MONITOR/REJECT]
-FINAL POSITION SIZE: X.X%
-RISK RATING: [1-10]
-EXPECTED ANNUAL RETURN: X.X% (rough estimate)
-MAXIMUM EXPECTED LOSS: -X.X% (rough estimate)
-COMMITTEE CONSENSUS: bullet points (who agrees/disagrees)
-IMPLEMENTATION PLAN: bullet points (entry, stop, targets, monitoring)
-RISK OFFICER SUMMARY: 2-3 lines
-""",
-        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-    )
-
-    source = meta.get("source", "unknown")
-    dq = "OK" if stats_ok else "LOW"
-
     return f"""## {ticker} — Gemini Committee Report
 
-_Data quality: **{dq}** | Price source: **{source}** | Benchmark: **{bundle.get("benchmark","^GSPC")}**_
+_Data quality: **{dq}** | Price source: **{source}** | Benchmark: **{benchmark}**_
 
-{risk_officer}
+{cro}
 
 ---
 
 ## Full Committee Outputs
 
-{committee_blob}
+{full_committee}
 """
