@@ -6,40 +6,50 @@ import io
 import re
 from typing import Optional, Tuple, List, Dict, Any
 
+import requests
 from google import genai
 from google.genai import types
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
+# -------------------------
+# Models / Env
+# -------------------------
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
+
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4")
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")
 
 MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
 BACKOFF_BASE_SECONDS = float(os.getenv("GEMINI_BACKOFF_BASE_SECONDS", "1.5"))
 
-# Token budgets (tuned for reliability)
 TOKENS_AGENT = int(os.getenv("GEMINI_AGENT_TOKENS", "850"))
 TOKENS_CRO = int(os.getenv("GEMINI_CRO_TOKENS", "1700"))
 TOKENS_REPAIR = int(os.getenv("GEMINI_REPAIR_TOKENS", "650"))
-
-# How many repair passes allowed per section
 MAX_REPAIR_PASSES = int(os.getenv("GEMINI_MAX_REPAIR_PASSES", "2"))
 
-
 # -------------------------
-# Gemini Client + Call
+# Gemini
 # -------------------------
 
-def _client() -> genai.Client:
+def _gemini_client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY.")
     return genai.Client(api_key=api_key)
 
+def _is_gemini_quota_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    # Treat these as "quota/rate-limit" signals -> fallback to Grok if available
+    return any(x in msg for x in [
+        "429", "quota", "rate limit", "resource exhausted", "too many requests"
+    ])
 
 def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: int) -> str:
-    client = _client()
+    client = _gemini_client()
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=GEMINI_TEMPERATURE,
         max_output_tokens=max_output_tokens,
     )
 
@@ -47,7 +57,7 @@ def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: 
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = client.models.generate_content(
-                model=DEFAULT_MODEL,
+                model=GEMINI_MODEL,
                 contents=user_content,
                 config=config,
             )
@@ -55,16 +65,75 @@ def _gemini_call(system_instruction: str, user_content: str, max_output_tokens: 
         except Exception as e:
             last_err = e
             msg = str(e).lower()
-            transient = any(x in msg for x in ["429", "rate", "quota", "timeout", "503", "unavailable", "internal"])
+
+            # If it's quota/rate-limit, we want to fail fast so fallback can kick in.
+            if _is_gemini_quota_error(e):
+                raise
+
+            transient = any(x in msg for x in ["timeout", "503", "unavailable", "internal"])
             if attempt >= MAX_RETRIES or not transient:
                 raise
             time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
 
     raise last_err or RuntimeError("Gemini call failed.")
 
+# -------------------------
+# Grok (xAI) - OpenAI-compatible chat/completions
+# -------------------------
+
+def _has_xai() -> bool:
+    return bool(os.getenv("XAI_API_KEY"))
+
+def _xai_call(system_instruction: str, user_content: str, max_output_tokens: int) -> str:
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing XAI_API_KEY (required for Grok fallback).")
+
+    url = f"{XAI_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    payload = {
+        "model": XAI_MODEL,
+        "temperature": GEMINI_TEMPERATURE,
+        "max_tokens": max_output_tokens,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_content},
+        ],
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"xAI API error {r.status_code}: {r.text[:4000]}")
+
+    j = r.json()
+    try:
+        return (j["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        raise RuntimeError(f"xAI unexpected response: {str(j)[:4000]}")
 
 # -------------------------
-# Data helpers
+# Unified LLM call: Gemini -> fallback Grok on quota
+# -------------------------
+
+def llm_call(system_instruction: str, user_content: str, max_output_tokens: int) -> str:
+    """
+    Try Gemini first. If Gemini errors due to quota/rate limit, and XAI_API_KEY exists,
+    fallback to Grok Cloud (xAI).
+    """
+    try:
+        return _gemini_call(system_instruction, user_content, max_output_tokens)
+    except Exception as e:
+        if _is_gemini_quota_error(e) and _has_xai():
+            return _xai_call(system_instruction, user_content, max_output_tokens)
+        raise
+
+# -------------------------
+# Data helpers (same as before)
 # -------------------------
 
 def _parse_stooq_csv(csv_text: str) -> List[float]:
@@ -84,11 +153,7 @@ def _parse_stooq_csv(csv_text: str) -> List[float]:
             continue
     return closes
 
-
 def _extract_closes(bundle: Dict[str, Any]) -> Tuple[List[float], str]:
-    """
-    Prefer Yahoo chart closes, then Stooq CSV closes, then Massive aggs closes.
-    """
     y = bundle.get("yahoo_chart") or {}
     y_closes = y.get("closes")
     if isinstance(y_closes, list) and len(y_closes) >= 10:
@@ -115,7 +180,6 @@ def _extract_closes(bundle: Dict[str, Any]) -> Tuple[List[float], str]:
 
     return [], "none"
 
-
 def _daily_returns_from_closes(closes: List[float]) -> List[float]:
     rets: List[float] = []
     for i in range(1, len(closes)):
@@ -124,7 +188,6 @@ def _daily_returns_from_closes(closes: List[float]) -> List[float]:
         if prev and prev > 0:
             rets.append((cur / prev) - 1.0)
     return rets
-
 
 def _max_drawdown(closes: List[float]) -> Optional[float]:
     if len(closes) < 3:
@@ -139,12 +202,10 @@ def _max_drawdown(closes: List[float]) -> Optional[float]:
             mdd = dd
     return mdd
 
-
 def _best_worst_day(daily_rets: List[float]) -> Tuple[Optional[float], Optional[float]]:
     if not daily_rets:
         return None, None
     return max(daily_rets), min(daily_rets)
-
 
 def _corr(x: List[float], y: List[float]) -> Optional[float]:
     n = min(len(x), len(y))
@@ -161,7 +222,6 @@ def _corr(x: List[float], y: List[float]) -> Optional[float]:
         return None
     return cov / (math.sqrt(vx) * math.sqrt(vy))
 
-
 def _beta(asset_rets: List[float], bench_rets: List[float]) -> Optional[float]:
     n = min(len(asset_rets), len(bench_rets))
     if n < 5:
@@ -175,7 +235,6 @@ def _beta(asset_rets: List[float], bench_rets: List[float]) -> Optional[float]:
     ma = sum(a) / n
     cov = sum((ai - ma) * (bi - mb) for ai, bi in zip(a, b)) / (n - 1)
     return cov / vb
-
 
 def _calc_stats(closes: List[float]) -> Dict[str, Any]:
     if len(closes) < 10:
@@ -214,11 +273,6 @@ def _calc_stats(closes: List[float]) -> Dict[str, Any]:
         "best_day": best_day,
         "worst_day": worst_day,
     }
-
-
-# -------------------------
-# Factsheet builder
-# -------------------------
 
 def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     closes, source = _extract_closes(bundle)
@@ -298,18 +352,15 @@ def _make_factsheet(ticker: str, bundle: Dict[str, Any]) -> Tuple[str, Dict[str,
     meta = {"source": source, "stats": stats, "bench_stats": bench_stats}
     return "\n".join(facts), meta
 
-
 # -------------------------
-# Validators + Repair
+# Validation + Repair
 # -------------------------
 
 def _count_bullets(block: str) -> int:
     return len(re.findall(r"(?m)^\s*-\s+", block or ""))
 
-
 def _has_fields(text: str, fields: List[str]) -> bool:
     return all(f in (text or "") for f in fields)
-
 
 def _repair_section(section_name: str, factsheet: str, draft: str, required_fields: List[str], min_bullets: int) -> str:
     prompt = f"""
@@ -332,12 +383,11 @@ REQUIRED FIELDS (must all appear):
 
 Return ONLY the repaired section.
 """
-    return _gemini_call(
+    return llm_call(
         system_instruction="You are a strict formatter. Never omit required fields.",
         user_content=prompt,
         max_output_tokens=TOKENS_REPAIR,
     ).strip()
-
 
 def _ensure_valid(section_name: str, factsheet: str, draft: str, required_fields: List[str], min_bullets: int) -> str:
     text = (draft or "").strip()
@@ -348,7 +398,6 @@ def _ensure_valid(section_name: str, factsheet: str, draft: str, required_fields
             return text
         text = _repair_section(section_name, factsheet, text, required_fields, min_bullets)
     return text
-
 
 # -------------------------
 # Committee runner
@@ -372,7 +421,7 @@ FACTSHEET:
 {factsheet}
 """
 
-    buffett_raw = _gemini_call(
+    buffett_raw = llm_call(
         system_instruction="You are Warren Buffett. Value investing, moat, quality, patience.",
         user_content=common + """
 Output format (exact labels required):
@@ -389,21 +438,12 @@ RISK FACTORS:
     )
 
     buffett = _ensure_valid(
-        "BUFFETT",
-        factsheet,
-        buffett_raw,
-        required_fields=[
-            "BUFFETT RECOMMENDATION:",
-            "CONVICTION LEVEL:",
-            "TARGET ALLOCATION:",
-            "TIME HORIZON:",
-            "INVESTMENT THESIS:",
-            "RISK FACTORS:",
-        ],
-        min_bullets=6,  # 3 thesis + 3 risks
+        "BUFFETT", factsheet, buffett_raw,
+        ["BUFFETT RECOMMENDATION:", "CONVICTION LEVEL:", "TARGET ALLOCATION:", "TIME HORIZON:", "INVESTMENT THESIS:", "RISK FACTORS:"],
+        min_bullets=6,
     )
 
-    munger_raw = _gemini_call(
+    munger_raw = llm_call(
         system_instruction="You are Charlie Munger. Mental models, incentives, second-order thinking.",
         user_content=common + """
 Output format (exact labels required):
@@ -419,20 +459,12 @@ CONTRARIAN INSIGHTS:
     )
 
     munger = _ensure_valid(
-        "MUNGER",
-        factsheet,
-        munger_raw,
-        required_fields=[
-            "MUNGER ANALYSIS:",
-            "RISK RATING:",
-            "CIRCLE OF COMPETENCE:",
-            "KEY MENTAL MODELS APPLIED:",
-            "CONTRARIAN INSIGHTS:",
-        ],
+        "MUNGER", factsheet, munger_raw,
+        ["MUNGER ANALYSIS:", "RISK RATING:", "CIRCLE OF COMPETENCE:", "KEY MENTAL MODELS APPLIED:", "CONTRARIAN INSIGHTS:"],
         min_bullets=6,
     )
 
-    ackman_raw = _gemini_call(
+    ackman_raw = llm_call(
         system_instruction="You are Bill Ackman. Catalysts, governance, sizing discipline.",
         user_content=common + """
 Output format (exact labels required):
@@ -449,21 +481,12 @@ CATALYSTS:
     )
 
     ackman = _ensure_valid(
-        "ACKMAN",
-        factsheet,
-        ackman_raw,
-        required_fields=[
-            "ACKMAN POSITION:",
-            "CONVICTION LEVEL:",
-            "CATALYST TIMELINE:",
-            "TARGET POSITION SIZE:",
-            "THESIS:",
-            "CATALYSTS:",
-        ],
+        "ACKMAN", factsheet, ackman_raw,
+        ["ACKMAN POSITION:", "CONVICTION LEVEL:", "CATALYST TIMELINE:", "TARGET POSITION SIZE:", "THESIS:", "CATALYSTS:"],
         min_bullets=6,
     )
 
-    cohen_raw = _gemini_call(
+    cohen_raw = llm_call(
         system_instruction="You are Steve Cohen. Tactical trading, risk control, stops.",
         user_content=common + """
 Output format (exact labels required):
@@ -483,22 +506,12 @@ KEY DRIVERS:
     )
 
     cohen = _ensure_valid(
-        "COHEN",
-        factsheet,
-        cohen_raw,
-        required_fields=[
-            "COHEN TRADE:",
-            "CONVICTION:",
-            "POSITION SIZE:",
-            "ENTRY:",
-            "TAKE PROFIT:",
-            "STOP LOSS:",
-            "KEY DRIVERS:",
-        ],
-        min_bullets=12,  # 3 bullets per list x4
+        "COHEN", factsheet, cohen_raw,
+        ["COHEN TRADE:", "CONVICTION:", "POSITION SIZE:", "ENTRY:", "TAKE PROFIT:", "STOP LOSS:", "KEY DRIVERS:"],
+        min_bullets=12,
     )
 
-    dalio_raw = _gemini_call(
+    dalio_raw = llm_call(
         system_instruction="You are Ray Dalio. Macro regimes, risk balance, diversification.",
         user_content=common + """
 Output format (exact labels required):
@@ -516,32 +529,21 @@ PORTFOLIO FIT:
     )
 
     dalio = _ensure_valid(
-        "DALIO",
-        factsheet,
-        dalio_raw,
-        required_fields=[
-            "DALIO STRATEGY:",
-            "MACRO ENVIRONMENT SCORE:",
-            "DIVERSIFICATION VALUE:",
-            "RISK CONTRIBUTION:",
-            "ECONOMIC SEASON:",
-            "MACRO ANALYSIS:",
-            "PORTFOLIO FIT:",
-        ],
+        "DALIO", factsheet, dalio_raw,
+        ["DALIO STRATEGY:", "MACRO ENVIRONMENT SCORE:", "DIVERSIFICATION VALUE:", "RISK CONTRIBUTION:", "ECONOMIC SEASON:", "MACRO ANALYSIS:", "PORTFOLIO FIT:"],
         min_bullets=6,
     )
 
-    # CRO: include HARD risk rules so it doesn't output nonsense
     cro_prompt = f"""
 You are the Chief Risk Officer & Portfolio Manager.
 You must output all required fields.
 
-Hard rules (apply deterministically):
+Hard rules:
 - If DATA_QUALITY is LOW => PORTFOLIO DECISION must be MONITOR and FINAL POSITION SIZE must be 0.0%.
 - If VOL_REGIME is ELEVATED and decision is IMPLEMENT/MODIFY => FINAL POSITION SIZE must be <= 2.0% and include a hard STOP LOSS in plan.
 - MAXIMUM EXPECTED LOSS must be a negative percent like -12.0%.
 - EXPECTED ANNUAL RETURN must be a percent like 15.0%.
-- Do not invent fundamentals or news; use only FACTSHEET + committee.
+- Use only FACTSHEET + committee.
 
 FACTSHEET:
 {factsheet}
@@ -549,16 +551,12 @@ FACTSHEET:
 COMMITTEE (verbatim):
 BUFFETT:
 {buffett}
-
 MUNGER:
 {munger}
-
 ACKMAN:
 {ackman}
-
 COHEN:
 {cohen}
-
 DALIO:
 {dalio}
 
@@ -575,27 +573,17 @@ IMPLEMENTATION PLAN:
 RISK OFFICER SUMMARY: 2-3 lines
 """
 
-    cro_raw = _gemini_call(
+    cro_raw = llm_call(
         system_instruction="You are a strict CRO. Never omit fields. Follow hard rules.",
         user_content=cro_prompt,
         max_output_tokens=TOKENS_CRO,
     )
 
     cro = _ensure_valid(
-        "CRO",
-        factsheet,
-        cro_raw,
-        required_fields=[
-            "PORTFOLIO DECISION:",
-            "FINAL POSITION SIZE:",
-            "RISK RATING:",
-            "EXPECTED ANNUAL RETURN:",
-            "MAXIMUM EXPECTED LOSS:",
-            "COMMITTEE CONSENSUS:",
-            "IMPLEMENTATION PLAN:",
-            "RISK OFFICER SUMMARY:",
-        ],
-        min_bullets=6,  # 3 consensus + 3 plan
+        "CRO", factsheet, cro_raw,
+        ["PORTFOLIO DECISION:", "FINAL POSITION SIZE:", "RISK RATING:", "EXPECTED ANNUAL RETURN:", "MAXIMUM EXPECTED LOSS:",
+         "COMMITTEE CONSENSUS:", "IMPLEMENTATION PLAN:", "RISK OFFICER SUMMARY:"],
+        min_bullets=6,
     )
 
     dq = "OK" if stats_ok else "LOW"
@@ -620,6 +608,11 @@ RISK OFFICER SUMMARY: 2-3 lines
 === DALIO ===
 {dalio}
 """.strip()
+
+    provider = "gemini"
+    # crude visibility: if Gemini key missing but Grok used, etc. (optional)
+    if not os.getenv("GEMINI_API_KEY") and os.getenv("XAI_API_KEY"):
+        provider = "xai"
 
     return f"""## {ticker} — Gemini Committee Report
 
