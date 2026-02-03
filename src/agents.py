@@ -1,217 +1,253 @@
-import csv
-import io
-import math
-from datetime import datetime
+# src/agents.py
+# Gemini (Google Gen AI SDK) implementation of the multi-agent “hedge fund committee”.
+# Requires: pip install google-genai
+# Env vars:
+#   GEMINI_API_KEY   (required)
+#   GEMINI_MODEL     (optional, default: gemini-2.5-flash)
+#   GEMINI_TEMPERATURE (optional, default: 0.4)
+#   GEMINI_MAX_OUTPUT_TOKENS (optional, default: 1200)
 
-# ---------- helpers ----------
+import os
+import time
+import json
+from typing import Optional
 
-def _safe_get(d, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+from google import genai
+from google.genai import types
 
-def _parse_stooq_csv(csv_text: str):
-    rows = []
-    if not csv_text:
-        return rows
-    reader = csv.DictReader(io.StringIO(csv_text))
-    for r in reader:
+
+# --------- configuration ---------
+
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1200"))
+
+# Basic exponential backoff for transient errors (429/503/etc.)
+MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+BACKOFF_BASE_SECONDS = float(os.getenv("GEMINI_BACKOFF_BASE_SECONDS", "1.5"))
+
+
+def _client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY. Add it as a GitHub Actions secret and pass it to the workflow.")
+    return genai.Client(api_key=api_key)
+
+
+def _pretty_json(obj, max_chars: int = 120_000) -> str:
+    """
+    Keep prompt size reasonable; Gemini can handle large context, but you don't want
+    to dump megabytes of JSON and blow latency/cost.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        s = str(obj)
+
+    if len(s) > max_chars:
+        return s[:max_chars] + "\n... (truncated) ..."
+    return s
+
+
+def chat(
+    *,
+    system_instruction: str,
+    user_content: str,
+    model: str = DEFAULT_MODEL,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> str:
+    """
+    Single Gemini call with retries. Returns response text.
+    """
+    client = _client()
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+
+    last_err: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            close = float(r.get("Close", "") or 0)
-            date = r.get("Date")
-            if close > 0 and date:
-                rows.append({"date": date, "close": close})
-        except Exception:
-            continue
-    return rows
+            resp = client.models.generate_content(
+                model=model,
+                contents=user_content,
+                config=config,
+            )
+            return (getattr(resp, "text", None) or "").strip()
+        except Exception as e:
+            last_err = e
+            # crude transient detection; Gemini SDK wraps HTTP errors
+            msg = str(e).lower()
+            is_transient = any(x in msg for x in ["429", "rate", "quota", "timeout", "503", "unavailable", "internal"])
+            if attempt >= MAX_RETRIES or not is_transient:
+                raise
+            sleep_s = BACKOFF_BASE_SECONDS * (2 ** attempt)
+            time.sleep(sleep_s)
 
-# ---------- price extraction ----------
+    # should never reach here
+    raise last_err or RuntimeError("Gemini call failed.")
 
-def _extract_prices(bundle: dict):
-    # 1) Yahoo fallback (best global coverage)
-    y = bundle.get("fallback_prices_yahoo") or {}
-    y_closes = y.get("closes")
-    if isinstance(y_closes, list) and len(y_closes) >= 10:
-        return [float(x) for x in y_closes if x], "yahoo_fallback"
-
-    # 2) Stooq fallback
-    fb = bundle.get("fallback_prices", {})
-    rows = _parse_stooq_csv(fb.get("csv", ""))
-    rows = rows[-30:]
-    closes = [x["close"] for x in rows]
-    if len(closes) >= 10:
-        return closes, "stooq_fallback"
-
-    return [], "none"
-
-# ---------- stats ----------
-
-def _calc_stats(closes):
-    if len(closes) < 10:
-        return {}
-
-    ret_30d = (closes[-1] / closes[0]) - 1.0
-
-    daily = [(closes[i] / closes[i-1]) - 1.0 for i in range(1, len(closes)) if closes[i-1] > 0]
-    vol = math.sqrt(sum((x - sum(daily)/len(daily))**2 for x in daily)/(len(daily)-1)) * math.sqrt(252)
-
-    return {
-        "last": closes[-1],
-        "ret_30d": ret_30d,
-        "vol": vol
-    }
-
-# ---------- fundamentals (bank-aware, free) ----------
-
-def _bank_quality_score(bundle):
-    score = 5
-    notes = []
-
-    ov = bundle.get("overview") or {}
-    mcap = _safe_get(ov, "results", "market_cap")
-    sector = _safe_get(ov, "results", "sic_description", "")
-
-    if mcap:
-        try:
-            if float(mcap) > 50e9:
-                score += 1; notes.append("Large-cap European bank")
-        except Exception:
-            pass
-
-    if "bank" in sector.lower():
-        score += 1; notes.append("Core banking business")
-
-    # conservative cap
-    score = max(1, min(8, score))
-    return score, notes
-
-# ---------- Buffett heuristic ----------
-
-def _buffett(stats, q_score, q_notes):
-    if not stats:
-        return {"rec": "HOLD", "conv": 4, "alloc": "0–5%", "thesis": ["Insufficient price data"], "risks": ["Data limits"]}
-
-    ret = stats["ret_30d"]
-    vol = stats["vol"]
-
-    rec = "HOLD"
-    alloc = "0–10%"
-    conv = 5
-
-    if q_score >= 6 and ret < 0.25 and vol < 0.35:
-        rec = "BUY"; alloc = "5–15%"; conv = 7
-
-    return {
-        "rec": rec,
-        "conv": conv,
-        "alloc": alloc,
-        "thesis": [
-            f"Quality score (bank-aware): {q_score}/8",
-            f"30d return: {ret*100:.1f}%",
-            f"Volatility: {vol*100:.1f}%"
-        ] + q_notes,
-        "risks": [
-            "Short lookback window",
-            "Free-mode fundamentals",
-            "Banking sector cyclicality"
-        ]
-    }
-
-# ---------- trader heuristic ----------
-
-def _trader(stats):
-    if not stats:
-        return {"stance": "NO-TRADE", "conv": 3, "levels": []}
-
-    ret = stats["ret_30d"]
-    last = stats["last"]
-    vol = stats["vol"]
-
-    stance = "LONG" if ret > 0.05 else "NO-TRADE"
-
-    stop = last * (1 - 0.04)
-    tp = last * (1 + 0.08)
-
-    return {
-        "stance": stance,
-        "conv": 5 if stance == "LONG" else 4,
-        "levels": [
-            f"Entry ~ {last:.2f}",
-            f"Stop ~ {stop:.2f}",
-            f"Target ~ {tp:.2f}"
-        ]
-    }
-
-# ---------- risk officer ----------
-
-def _risk_officer(buffett, trader, stats, source):
-    vol = stats.get("vol", 0)
-
-    regime = "Normal volatility" if vol < 0.35 else "Elevated volatility"
-
-    if buffett["rec"] == "BUY" and trader["stance"] == "LONG":
-        decision = "IMPLEMENT (TACTICAL)"
-        size = "2–5%"
-    elif buffett["rec"] == "HOLD" and trader["stance"] == "LONG":
-        decision = "IMPLEMENT (SMALL)"
-        size = "1–3%"
-    else:
-        decision = "MONITOR"
-        size = "0–5%"
-
-    return decision, size, regime, [
-        f"Data source: {source}",
-        f"Buffett: {buffett['rec']} ({buffett['alloc']})",
-        f"Trader: {trader['stance']}",
-        f"Market regime: {regime}"
-    ]
-
-# ---------- main ----------
 
 def run_committee(ticker: str, bundle: dict) -> str:
-    closes, source = _extract_prices(bundle)
-    stats = _calc_stats(closes) if closes else {}
+    """
+    Produces the same style of output you had with the OpenAI version:
+      Buffett, Munger, Ackman, Cohen, Dalio + Risk Officer synthesis
+    """
+    context = f"""You are given a MARKET DATA BUNDLE (JSON) for {ticker}.
+Extract key signals (price trend, volatility proxy, market cap if available, basic risk factors).
+If some fields are missing or errors are present, explicitly say so.
 
-    q_score, q_notes = _bank_quality_score(bundle)
-    buffett = _buffett(stats, q_score, q_notes)
-    trader = _trader(stats)
+MARKET BUNDLE (JSON):
+{_pretty_json(bundle)}
+"""
 
-    decision, size, regime, summary = _risk_officer(buffett, trader, stats, source)
+    # --- committee members ---
 
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    buffett = chat(
+        system_instruction=(
+            "You are Warren Buffett. Focus on business quality, economic moat, management, "
+            "intrinsic value vs price, and margin of safety. Be conservative and explainable."
+        ),
+        user_content=context
+        + """
+Output format:
+BUFFETT RECOMMENDATION: [BUY/HOLD/SELL]
+CONVICTION LEVEL: [1-10]
+TARGET ALLOCATION: [0-25%]
+TIME HORIZON: [5-10+ years]
+INVESTMENT THESIS: bullet points
+RISK FACTORS: bullet points
+""",
+        max_output_tokens=1000,
+    )
 
-    out = []
-    out.append(f"## {ticker} — FREE MODE AI Hedge Fund Report")
-    out.append(f"_Generated: {now}_\n")
+    munger = chat(
+        system_instruction=(
+            "You are Charlie Munger. Apply mental models, incentives, second-order effects. "
+            "Be skeptical and emphasize what could go wrong."
+        ),
+        user_content=context
+        + """
+Output format:
+MUNGER ANALYSIS: [OPPORTUNITY/CAUTION/AVOID]
+RISK RATING: [1-10]
+CIRCLE OF COMPETENCE: [IN/OUT/BORDERLINE]
+KEY MENTAL MODELS APPLIED: bullet points
+CONTRARIAN INSIGHTS: bullet points
+""",
+        max_output_tokens=900,
+    )
 
-    out.append("### Portfolio Decision")
-    out.append(f"**DECISION:** {decision}")
-    out.append(f"**POSITION SIZE:** {size}")
-    out.append(f"**MARKET REGIME:** {regime}\n")
+    ackman = chat(
+        system_instruction=(
+            "You are Bill Ackman. Focus on concentrated positions, catalysts, governance, and "
+            "what would need to change for value to be unlocked."
+        ),
+        user_content=context
+        + """
+Output format:
+ACKMAN POSITION: [LONG/SHORT/ACTIVIST LONG]
+CONVICTION LEVEL: [1-10]
+CATALYST TIMELINE: [6-36 months]
+TARGET POSITION SIZE: [5-20%]
+ENGAGEMENT PROBABILITY: [HIGH/MEDIUM/LOW]
+ACTIVIST THESIS: bullet points
+CATALYSTS: bullet points
+""",
+        max_output_tokens=900,
+    )
 
-    out.append("**RISK OFFICER SUMMARY:**")
-    out += [f"- {x}" for x in summary]
+    cohen = chat(
+        system_instruction=(
+            "You are Steve Cohen. Trading-oriented. Focus on positioning, timing, entry/exit, "
+            "stops, catalysts, and risk control."
+        ),
+        user_content=context
+        + """
+Output format:
+COHEN TRADE: [LONG/SHORT/HEDGE/NO-TRADE]
+CONVICTION: [1-10]
+POSITION SIZE: [%]
+ENTRY: levels/conditions
+TAKE PROFIT: levels
+STOP LOSS: levels
+KEY DRIVERS: bullet points
+""",
+        max_output_tokens=900,
+    )
 
-    out.append("\n---\n### Buffett-Style View")
-    out.append(f"**Recommendation:** {buffett['rec']} (conv {buffett['conv']}/10)")
-    out.append(f"**Allocation:** {buffett['alloc']}")
-    out.append("**Thesis:**")
-    out += [f"- {x}" for x in buffett["thesis"]]
-    out.append("**Risks:**")
-    out += [f"- {x}" for x in buffett["risks"]]
+    dalio = chat(
+        system_instruction=(
+            "You are Ray Dalio. Macro regimes, cycles, diversification, correlation, and "
+            "risk contribution. Think in scenarios."
+        ),
+        user_content=context
+        + """
+Output format:
+DALIO STRATEGY: [ALLOCATE/REDUCE/HEDGE/AVOID]
+MACRO ENVIRONMENT SCORE: [1-10]
+DIVERSIFICATION VALUE: [HIGH/MEDIUM/LOW]
+RISK CONTRIBUTION: [LOW/MEDIUM/HIGH]
+ECONOMIC SEASON: [GROWTH/RECESSION/REFLATION/STAGFLATION/UNKNOWN]
+MACRO ANALYSIS: bullet points
+PORTFOLIO FIT: bullet points
+""",
+        max_output_tokens=900,
+    )
 
-    out.append("\n---\n### Trader View")
-    out.append(f"**Stance:** {trader['stance']} (conv {trader['conv']}/10)")
-    if trader["levels"]:
-        out.append("**Levels:**")
-        out += [f"- {x}" for x in trader["levels"]]
+    committee_blob = f"""
+=== BUFFETT ===
+{buffett}
 
-    out.append("\n---\n### Notes")
-    out.append("- Fully free, rule-based model")
-    out.append("- Yahoo Finance used for global price coverage")
-    out.append("- Educational/demo use only")
+=== MUNGER ===
+{munger}
 
-    return "\n".join(out)
+=== ACKMAN ===
+{ackman}
+
+=== COHEN ===
+{cohen}
+
+=== DALIO ===
+{dalio}
+""".strip()
+
+    # --- synthesis (Risk Officer / PM) ---
+
+    risk_officer = chat(
+        system_instruction=(
+            "You are the Chief Risk Officer & Portfolio Manager. Synthesize the committee into "
+            "a single actionable decision with explicit risk controls. If data quality is weak, "
+            "reduce position sizing and confidence."
+        ),
+        user_content=committee_blob
+        + f"""
+
+Ticker: {ticker}
+
+Output format:
+PORTFOLIO DECISION: [IMPLEMENT/MODIFY/MONITOR/REJECT]
+FINAL POSITION SIZE: X.X%
+RISK RATING: [1-10]
+EXPECTED ANNUAL RETURN: X.X% (rough estimate)
+MAXIMUM EXPECTED LOSS: -X.X% (rough estimate)
+COMMITTEE CONSENSUS: bullet points (who agrees/disagrees)
+IMPLEMENTATION PLAN: bullet points (entry, stop, targets, monitoring)
+RISK OFFICER SUMMARY: 2-3 lines
+""",
+        max_output_tokens=1200,
+    )
+
+    return f"""## {ticker} — Gemini Committee Report
+
+{risk_officer}
+
+---
+
+## Full Committee Outputs
+
+{committee_blob}
+"""
